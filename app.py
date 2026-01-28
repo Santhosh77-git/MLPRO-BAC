@@ -5,23 +5,32 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# ======================
-# LOAD PICKLE FILES
-# ======================
-cost_model = pickle.load(open("model/cost_model.pkl", "rb"))
-duration_model = pickle.load(open("model/duration_model.pkl", "rb"))
-encoder = pickle.load(open("model/encoder.pkl", "rb"))
-feature_columns = pickle.load(open("model/feature_columns.pkl", "rb"))
+# =====================================================
+# LOAD MODELS & METADATA (LOAD ONCE → FAST)
+# =====================================================
+with open("model/cost_model.pkl", "rb") as f:
+    cost_model = pickle.load(f)
 
-# ======================
-# SHAP EXPLAINERS
-# ======================
+with open("model/duration_model.pkl", "rb") as f:
+    duration_model = pickle.load(f)
+
+with open("model/encoder.pkl", "rb") as f:
+    encoder = pickle.load(f)
+
+with open("model/feature_columns.pkl", "rb") as f:
+    FEATURE_COLUMNS = pickle.load(f)
+
+CATEGORICAL_COLS = encoder.feature_names_in_.tolist()
+
+# =====================================================
+# SHAP EXPLAINERS (TREE → LIGHTWEIGHT)
+# =====================================================
 cost_explainer = shap.TreeExplainer(cost_model)
 duration_explainer = shap.TreeExplainer(duration_model)
 
-# ======================
-# LABELS & RECOMMENDATIONS
-# ======================
+# =====================================================
+# HUMAN LABELS & ACTIONS
+# =====================================================
 FEATURE_LABELS = {
     "terrain_type_hilly": "Hilly terrain",
     "material_availability_low": "Low material availability",
@@ -40,52 +49,82 @@ RECOMMENDATIONS = {
     "skilled_manpower_ratio": "Increase skilled manpower availability"
 }
 
-# ======================
-# PREDICTION ENDPOINT
-# ======================
-@app.route("/predict", methods=["POST"])
-def predict():
-    user_input = request.json
+# =====================================================
+# HELPER: PREPROCESS INPUT
+# =====================================================
+def preprocess_input(user_input: dict) -> pd.DataFrame:
     df = pd.DataFrame([user_input])
 
-    # ======================
-    # PREPROCESSING
-    # ======================
-    categorical_cols = encoder.feature_names_in_.tolist()
-
-    for col in categorical_cols:
+    # Ensure all categorical columns exist
+    for col in CATEGORICAL_COLS:
         if col not in df.columns:
             df[col] = "unknown"
 
-    df[categorical_cols] = df[categorical_cols].astype(str).fillna("unknown")
-    numerical_cols = [col for col in df.columns if col not in categorical_cols]
+    df[CATEGORICAL_COLS] = df[CATEGORICAL_COLS].astype(str).fillna("unknown")
+    numerical_cols = [c for c in df.columns if c not in CATEGORICAL_COLS]
 
-    encoded_cat = encoder.transform(df[categorical_cols])
-    encoded_cat_df = pd.DataFrame(
-        encoded_cat,
-        columns=encoder.get_feature_names_out(categorical_cols)
+    # Encode categorical
+    encoded = encoder.transform(df[CATEGORICAL_COLS])
+    encoded_df = pd.DataFrame(
+        encoded,
+        columns=encoder.get_feature_names_out(CATEGORICAL_COLS)
     )
 
-    num_df = df[numerical_cols].reset_index(drop=True)
-    final_df = pd.concat([encoded_cat_df, num_df], axis=1)
-    final_df = final_df.reindex(columns=feature_columns, fill_value=0)
+    final_df = pd.concat([encoded_df, df[numerical_cols]], axis=1)
+    final_df = final_df.reindex(columns=FEATURE_COLUMNS, fill_value=0)
 
-    # ======================
-    # PREDICTIONS
-    # ======================
-    cost = round(float(cost_model.predict(final_df)[0]), 2)
-    duration = round(float(duration_model.predict(final_df)[0]), 2)
+    return final_df
 
-    # ======================
-    # SHAP
-    # ======================
+# =====================================================
+# HELPER: SHAP ANALYSIS
+# =====================================================
+def compute_shap(final_df: pd.DataFrame):
     shap_cost = cost_explainer.shap_values(final_df)[0]
     shap_duration = duration_explainer.shap_values(final_df)[0]
 
     shap_total = pd.Series(
         shap_cost + shap_duration,
-        index=feature_columns
+        index=FEATURE_COLUMNS
     ).sort_values(ascending=False)
+
+    return shap_total
+
+# =====================================================
+# HELPER: WHAT-IF ANALYSIS
+# =====================================================
+def what_if_analysis(user_input, factor, values):
+    results = []
+
+    for v in values:
+        modified = user_input.copy()
+        modified[factor] = v
+
+        temp_df = preprocess_input(modified)
+        pred_cost = round(float(cost_model.predict(temp_df)[0]), 2)
+
+        results.append(pred_cost)
+
+    return results
+
+# =====================================================
+# PREDICTION ENDPOINT
+# =====================================================
+@app.route("/predict", methods=["POST"])
+def predict():
+    user_input = request.json
+
+    # -------------------------
+    # PREPROCESS & PREDICT
+    # -------------------------
+    final_df = preprocess_input(user_input)
+
+    cost = round(float(cost_model.predict(final_df)[0]), 2)
+    duration = round(float(duration_model.predict(final_df)[0]), 2)
+
+    # -------------------------
+    # SHAP EXPLANATION
+    # -------------------------
+    shap_total = compute_shap(final_df)
 
     risks, actions = [], []
 
@@ -99,9 +138,9 @@ def predict():
     risks = list(dict.fromkeys(risks))[:3]
     actions = list(dict.fromkeys(actions))[:3]
 
-    # ======================
-    # 📊 GRAPH DATA
-    # ======================
+    # -------------------------
+    # GRAPH DATA
+    # -------------------------
 
     # 1️⃣ Planned vs Predicted
     planned_vs_predicted = {
@@ -139,42 +178,28 @@ def predict():
         "values": [round(v * 100, 2) for _, v in top_factors]
     }
 
-    # 3️⃣ What-If Analysis (Vendor Rating)
-    what_if_x = [1, 2, 3, 4, 5]
-    what_if_y = []
+    # 3️⃣ What-If (Top 3 Factors)
+    what_if_graphs = []
 
-    for rating in what_if_x:
-        modified = user_input.copy()
-        modified["vendor_rating"] = rating
-
-        temp_df = pd.DataFrame([modified])
-        temp_df[categorical_cols] = temp_df[categorical_cols].astype(str)
-
-        enc = encoder.transform(temp_df[categorical_cols])
-        enc_df = pd.DataFrame(
-            enc,
-            columns=encoder.get_feature_names_out(categorical_cols)
-        )
-
-        temp_final = pd.concat(
-            [enc_df, temp_df[numerical_cols]],
-            axis=1
-        ).reindex(columns=feature_columns, fill_value=0)
-
-        what_if_y.append(
-            round(float(cost_model.predict(temp_final)[0]), 2)
-        )
-
-    what_if_graph = {
-        "factor": "Vendor Rating",
-        "x": what_if_x,
-        "y": what_if_y,
-        "current_value": user_input.get("vendor_rating")
+    WHAT_IF_FACTORS = {
+        "vendor_rating": [1, 2, 3, 4, 5],
+        "weather_severity_index": [0, 1, 2, 3, 4],
+        "skilled_manpower_ratio": [0.4, 0.6, 0.8, 1.0, 1.2]
     }
 
-    # ======================
+    for factor, values in WHAT_IF_FACTORS.items():
+        y_vals = what_if_analysis(user_input, factor, values)
+
+        what_if_graphs.append({
+            "factor": factor.replace("_", " ").title(),
+            "x": values,
+            "y": y_vals,
+            "current_value": user_input.get(factor)
+        })
+
+    # -------------------------
     # RESPONSE
-    # ======================
+    # -------------------------
     return jsonify({
         "prediction": {
             "predicted_cost_lakhs": cost,
@@ -187,11 +212,12 @@ def predict():
         "graphs": {
             "planned_vs_predicted": planned_vs_predicted,
             "top_factors": top_factors_graph,
-            "what_if": what_if_graph
+            "what_if": what_if_graphs
         }
     })
 
-
-
+# =====================================================
+# RUN
+# =====================================================
 if __name__ == "__main__":
     app.run(debug=True)
